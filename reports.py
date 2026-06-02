@@ -918,6 +918,89 @@ sorted by severity).
 """
 
 
+# ---------------------------------------------------------------- server profiles
+
+def gather_server_profiles(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
+    """Pull all server profiles and roll them into a compact summary plus
+    a per-profile row list. AssignedServer is a nested reference; the row
+    just records whether it's set (boolean) so the format step can render
+    Assigned/Unassigned without exposing the Moid soup."""
+
+    def step(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    step("Querying server profiles…")
+    profiles = _call_tool(mcp, "get_server_profiles", {"top": 500})
+
+    rows: list[dict[str, Any]] = []
+    for p in profiles:
+        assigned_ref = p.get("AssignedServer")
+        is_assigned = bool(assigned_ref) if not isinstance(assigned_ref, dict) else bool(assigned_ref.get("Moid"))
+        assigned_name = ""
+        if isinstance(assigned_ref, dict):
+            assigned_name = assigned_ref.get("Name") or assigned_ref.get("Moid") or ""
+        rows.append({
+            "name": p.get("Name") or "(unnamed)",
+            "type": p.get("Type") or "",
+            "target_platform": p.get("TargetPlatform") or "",
+            "config_context": (p.get("ConfigContext") or {}).get("ConfigState") if isinstance(p.get("ConfigContext"), dict) else "",
+            "assigned": "Yes" if is_assigned else "No",
+            "assigned_server": assigned_name,
+            "description": p.get("Description") or "",
+        })
+    rows.sort(key=lambda r: r["name"])
+
+    assigned_count = sum(1 for r in rows if r["assigned"] == "Yes")
+    unassigned_count = len(rows) - assigned_count
+
+    _log(
+        f"server profiles gather: total={len(rows)} "
+        f"assigned={assigned_count} unassigned={unassigned_count}"
+    )
+    return {
+        "profiles": rows,
+        "total": len(rows),
+        "assigned": assigned_count,
+        "unassigned": unassigned_count,
+    }
+
+
+def format_server_profiles_prompt(data: dict[str, Any]) -> str:
+    rows = data["profiles"]
+    if not rows:
+        return _empty_template(
+            "Server Profiles",
+            "No server profiles found in this environment.",
+        )
+    return f"""\
+You will format pre-computed Intersight server profile data as a clean
+markdown report. All values below are authoritative — render them
+exactly, do NOT invent or modify any. Reply in English only.
+
+PRE-COMPUTED DATA (JSON):
+```json
+{json.dumps(data, indent=2)}
+```
+
+OUTPUT — produce exactly this structure with no commentary, preamble,
+or sign-off:
+
+# Server Profiles
+
+**Total:** {data["total"]} ({data["assigned"]} assigned, {data["unassigned"]} unassigned)
+
+A markdown table (pipe syntax) with EXACTLY these columns in this order:
+| Name | Type | Target Platform | Config State | Assigned | Assigned Server | Description |
+
+Render ONE row per entry in the `profiles` array above, in the order
+shown. Use the field mappings: name->Name, type->Type,
+target_platform->Target Platform, config_context->Config State,
+assigned->Assigned, assigned_server->Assigned Server,
+description->Description. Do NOT skip any rows.
+"""
+
+
 # ---------------------------------------------------------------- list tools
 
 def gather_tools_list(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
@@ -1045,6 +1128,14 @@ TOOLS_LIST_SPEC = ReportSpec(
     format_prompt=format_tools_list_prompt,
 )
 
+SERVER_PROFILES_SPEC = ReportSpec(
+    label="Server Profiles",
+    slug="server-profiles",
+    user_message="list server profiles",
+    gather=gather_server_profiles,
+    format_prompt=format_server_profiles_prompt,
+)
+
 
 @dataclass
 class ChatRoute:
@@ -1091,6 +1182,19 @@ CHAT_ROUTES: list[ChatRoute] = [
             "what can you do",
         ),
         spec=TOOLS_LIST_SPEC,
+    ),
+    # Server profiles route comes AFTER the "list server" route above, but
+    # the "list server" triggers ("list server detail", "list servers", etc.)
+    # do not match "list server profile", so the substring matcher falls
+    # through to this entry. Keep this block after SERVER_DETAILS_SPEC so
+    # the routing precedence stays explicit.
+    ChatRoute(
+        triggers=(
+            "list server profile", "server profile", "show profiles",
+            "show server profile", "show me profiles", "list profiles",
+            "unassigned profile", "assigned profile",
+        ),
+        spec=SERVER_PROFILES_SPEC,
     ),
 ]
 
