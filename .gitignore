@@ -24,5 +24,8 @@ secrets.json
 .idea/
 .vscode/
 
+# Local-only demo materials (PDF brief, generator script, preview images)
+.demo/
+
 # Misc
 *.log
