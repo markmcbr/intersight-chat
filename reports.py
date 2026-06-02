@@ -927,9 +927,14 @@ sorted by severity).
 
 def gather_server_profiles(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
     """Pull all server profiles and roll them into a compact summary plus
-    a per-profile row list. AssignedServer is a nested reference; the row
-    just records whether it's set (boolean) so the format step can render
-    Assigned/Unassigned without exposing the Moid soup."""
+    a per-profile row list.
+
+    Intersight returns AssignedServer as a nested reference that contains
+    only a Moid/ClassId — no human-readable Name. To make the
+    "Assigned Server" column useful we additionally fetch the physical
+    server inventory and build a Moid->Name map. If the inventory call
+    fails or a Moid isn't found we fall back to a short Moid suffix so
+    the column is never empty for an assigned profile."""
 
     def step(msg: str) -> None:
         if progress is not None:
@@ -938,13 +943,36 @@ def gather_server_profiles(mcp: IntersightMCPClient, progress: ProgressCb = None
     step("Querying server profiles…")
     profiles = _call_tool(mcp, "get_server_profiles", {"top": 500})
 
+    # Build Moid -> server Name map. Best-effort: if this call fails for
+    # any reason (e.g., role scoping that allows profiles but not
+    # inventory) we still render the table, just with shortened Moids.
+    server_name_by_moid: dict[str, str] = {}
+    try:
+        step("Resolving assigned server names…")
+        servers = _call_tool(mcp, "get_physical_servers", {"top": 1000})
+        for s in servers:
+            moid = s.get("Moid")
+            name = s.get("Name")
+            if moid and name:
+                server_name_by_moid[moid] = name
+    except Exception as e:  # noqa: BLE001 — best-effort enrichment
+        _log(f"server profiles: physical server lookup failed: {e}")
+
     rows: list[dict[str, Any]] = []
     for p in profiles:
         assigned_ref = p.get("AssignedServer")
         is_assigned = bool(assigned_ref) if not isinstance(assigned_ref, dict) else bool(assigned_ref.get("Moid"))
         assigned_name = ""
         if isinstance(assigned_ref, dict):
-            assigned_name = assigned_ref.get("Name") or assigned_ref.get("Moid") or ""
+            moid = assigned_ref.get("Moid") or ""
+            # Prefer (1) any Name the API happened to inline, then
+            # (2) the Moid->Name map, then (3) a short Moid suffix so
+            # the column still gives the operator something to grep for.
+            assigned_name = (
+                assigned_ref.get("Name")
+                or server_name_by_moid.get(moid)
+                or (f"…{moid[-6:]}" if moid else "")
+            )
         rows.append({
             "name": p.get("Name") or "(unnamed)",
             "type": p.get("Type") or "",
