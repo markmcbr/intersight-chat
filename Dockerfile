@@ -41,11 +41,8 @@ RUN cd mcp-server \
     && npm cache clean --force
 COPY --from=mcp-builder /build/mcp-server/dist mcp-server/dist
 
-# Streamlit app. Keep this list in sync with new top-level Python modules —
-# unlisted .py files won't make it into the image and will ImportError at
-# Streamlit startup. (We deliberately don't `COPY . .` to keep the image
-# slim and avoid bundling .env / *.pem / .git / .demo etc.)
-COPY app.py mcp_client.py orchestrator.py reports.py gpu_info.py ./
+# Streamlit app
+COPY app.py mcp_client.py orchestrator.py reports.py ./
 
 EXPOSE 8501
 
