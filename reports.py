@@ -918,6 +918,79 @@ sorted by severity).
 """
 
 
+# ---------------------------------------------------------------- list tools
+
+def gather_tools_list(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
+    """Return the live MCP tool inventory as a flat list of rows.
+
+    Calls the server-side `list_tools` tool so the table reflects whatever
+    the MCP server actually exposes (rather than a hardcoded copy that can
+    drift). Hidden tools (e.g. configure_credentials) are already filtered
+    out server-side. Falls back to the locally-cached MCP tool list if the
+    server-side tool errors or returns an unexpected shape.
+    """
+    if progress is not None:
+        progress("Listing MCP tools…")
+
+    rows: list[dict[str, str]] = []
+    try:
+        res = mcp.call_tool("list_tools", {})
+        if not res.is_error and res.text:
+            parsed = json.loads(res.text)
+            if isinstance(parsed, dict) and isinstance(parsed.get("tools"), list):
+                for t in parsed["tools"]:
+                    if not isinstance(t, dict):
+                        continue
+                    rows.append({
+                        "name": str(t.get("name") or ""),
+                        "description": str(t.get("description") or ""),
+                    })
+    except Exception as exc:
+        _log(f"list_tools: server call failed, falling back to client cache: {exc}")
+
+    if not rows:
+        for t in mcp.list_tools():
+            if t.name == "configure_credentials":
+                continue
+            first = t.description.split(".", 1)[0].strip()
+            rows.append({"name": t.name, "description": (first[:140] or t.description[:140])})
+
+    rows.sort(key=lambda r: r["name"])
+    _log(f"list tools gather: tools={len(rows)}")
+    return {"tools": rows}
+
+
+def format_tools_list_prompt(data: dict[str, Any]) -> str:
+    rows = data["tools"]
+    if not rows:
+        return _empty_template(
+            "Available Tools",
+            "No MCP tools are currently registered.",
+        )
+    return f"""\
+You will format a pre-computed MCP tool list as a clean markdown report.
+All values below are authoritative — render them exactly, do NOT invent,
+modify, or omit any. Reply in English only.
+
+PRE-COMPUTED DATA (JSON):
+```json
+{json.dumps(rows, indent=2)}
+```
+
+OUTPUT — produce exactly this structure with no commentary, preamble,
+or sign-off:
+
+# Available Tools
+
+A markdown table (pipe syntax) with EXACTLY these columns in this order:
+| Tool | What it does |
+
+Include ONE row per entry in the JSON above, in the order shown. Use
+the `name` field for the Tool column and the `description` field for
+the What it does column. Do NOT skip any rows.
+"""
+
+
 # ---------------------------------------------------------------- empty case
 
 def _empty_template(title: str, body: str) -> str:
@@ -964,6 +1037,14 @@ ALARM_DETAILS_SPEC = ReportSpec(
     format_prompt=format_alarm_details_prompt,
 )
 
+TOOLS_LIST_SPEC = ReportSpec(
+    label="Available Tools",
+    slug="tools",
+    user_message="list tools",
+    gather=gather_tools_list,
+    format_prompt=format_tools_list_prompt,
+)
+
 
 @dataclass
 class ChatRoute:
@@ -1002,6 +1083,14 @@ CHAT_ROUTES: list[ChatRoute] = [
             "show me alarms", "list alarms",
         ),
         spec=ALARM_DETAILS_SPEC,
+    ),
+    ChatRoute(
+        triggers=(
+            "list tools", "list tool", "show tools", "show me tools",
+            "what tools", "available tools", "list mcp", "list capabilities",
+            "what can you do",
+        ),
+        spec=TOOLS_LIST_SPEC,
     ),
 ]
 
