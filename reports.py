@@ -535,9 +535,14 @@ INVENTORY_REPORT = ReportSpec(
 )
 
 
-PRESET_REPORTS: dict[str, ReportSpec] = {
-    INVENTORY_REPORT.label: INVENTORY_REPORT,
-}
+# Inventory Report chip is temporarily disabled while the layout is being
+# reworked. The ReportSpec + gather_inventory_data + format_inventory_prompt
+# code above is intact so the chip can be re-enabled by adding the entry
+# back here:
+#     PRESET_REPORTS: dict[str, ReportSpec] = {
+#         INVENTORY_REPORT.label: INVENTORY_REPORT,
+#     }
+PRESET_REPORTS: dict[str, ReportSpec] = {}
 
 
 # ============================================================================
