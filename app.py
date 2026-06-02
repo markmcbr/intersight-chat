@@ -22,6 +22,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
+from gpu_info import GpuSnapshot, collect_snapshot, would_fit
 from mcp_client import IntersightMCPClient, default_client_from_env
 from orchestrator import Orchestrator, TurnEvent, TurnMetrics
 from reports import (
@@ -43,6 +44,18 @@ INTERSIGHT_BASE_URL = os.environ.get("INTERSIGHT_BASE_URL", "https://intersight.
 # match the Makefile's MODEL variable so the make-up-gpu auto-pull/auto-warm
 # targets the same model the app pre-selects.
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "mistral-small3.1:24b")
+
+# Optional operator-provided GPU descriptors for the sidebar GPU panel. Used
+# when nvidia-smi isn't reachable from inside the app container (which is the
+# default — the GPU is passed only to the ollama container). Set in compose:
+#   environment:
+#     GPU_LABEL: "NVIDIA L40S 48GB"
+#     TOTAL_VRAM_GB: "48"
+GPU_LABEL = os.environ.get("GPU_LABEL") or None
+try:
+    TOTAL_VRAM_GB = float(os.environ.get("TOTAL_VRAM_GB", "")) if os.environ.get("TOTAL_VRAM_GB") else None
+except ValueError:
+    TOTAL_VRAM_GB = None
 
 st.set_page_config(
     page_title="Intersight Chat",
@@ -241,6 +254,117 @@ def test_connection() -> tuple[str, str]:
     return "ok", "Connected (no account name returned)."
 
 
+# ---------------------------------------------------------------- GPU panel
+
+def _gpu_snapshot() -> GpuSnapshot:
+    """Cached one-shot GPU + model query. Streamlit caches per (args, ttl);
+    we key the cache on the GPU-related env vars so an operator restart
+    with different values invalidates the cache automatically.
+
+    TTL of 5s keeps the panel feeling live during a demo while skipping
+    redundant /api/ps roundtrips when the user is just typing in the
+    sidebar.
+    """
+    return collect_snapshot(
+        OLLAMA_BASE_URL,
+        env_gpu_label=GPU_LABEL,
+        env_total_vram_gb=TOTAL_VRAM_GB,
+    )
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _gpu_snapshot_cached(_cache_token: int) -> GpuSnapshot:
+    """`_cache_token` is bumped manually by the Refresh button to bypass TTL."""
+    return _gpu_snapshot()
+
+
+def render_gpu_panel() -> None:
+    """Sidebar GPU + model VRAM panel.
+
+    The visual story we want the demo audience to take away:
+      * The GPU has a fixed VRAM ceiling.
+      * Each loaded model claims a slice of that ceiling.
+      * Pulled-but-not-loaded models would each claim some additional
+        slice IF loaded — and we show whether they'd fit.
+
+    All numbers come from Ollama's /api/ps and /api/tags. If nvidia-smi
+    is reachable from this process (rare in our docker layout), we use
+    its truthful 'memory.used' for the bar; otherwise we sum the
+    per-loaded-model VRAM footprints Ollama reports.
+    """
+    ss = st.session_state
+    ss.setdefault("gpu_refresh_token", 0)
+
+    st.markdown("### 🖥️ GPU & Models")
+
+    col_left, col_right = st.columns([3, 1])
+    with col_right:
+        if st.button("⟳", help="Refresh now", use_container_width=True, key="gpu_refresh_btn"):
+            ss.gpu_refresh_token += 1
+            _gpu_snapshot_cached.clear()
+            st.rerun()
+
+    snap = _gpu_snapshot_cached(ss.gpu_refresh_token)
+
+    with col_left:
+        st.markdown(f"**{snap.gpu_label}**")
+
+    # ---- VRAM usage bar -------------------------------------------------
+    if snap.total_vram_gb is not None:
+        util_pct = snap.utilization_pct or 0.0
+        used_str = f"{snap.used_vram_gb:.1f} GB"
+        free_str = f"{snap.free_vram_gb:.1f} GB free" if snap.free_vram_gb is not None else ""
+        total_str = f"{snap.total_vram_gb:.0f} GB total"
+        st.caption(f"{used_str} used · {free_str} · {total_str}")
+        # Streamlit progress expects 0..1 float.
+        st.progress(min(1.0, max(0.0, util_pct / 100.0)))
+    else:
+        st.caption(
+            "Total VRAM unknown — set `TOTAL_VRAM_GB` in compose to enable "
+            "the usage bar (e.g. `TOTAL_VRAM_GB: \"48\"` for an L40S)."
+        )
+
+    # ---- Loaded models --------------------------------------------------
+    st.markdown("**Loaded in VRAM**")
+    if not snap.loaded:
+        st.caption("No models currently loaded.")
+    else:
+        for m in snap.loaded:
+            current = (m.name == ss.get("selected_model"))
+            badge = " · ✦ active" if current else ""
+            ctx_str = f" · {m.context_length:,} ctx" if m.context_length else ""
+            st.caption(f"• `{m.name}` — **{m.vram_gb:.1f} GB**{ctx_str}{badge}")
+
+    # ---- Pulled (on-disk) models with fit check ------------------------
+    if snap.pulled:
+        with st.expander(f"📦 Pulled models ({len(snap.pulled)})", expanded=False):
+            for p in snap.pulled:
+                fits, note = would_fit(p, snap)
+                if fits is None:
+                    icon = "·"
+                elif note == "loaded":
+                    icon = "✦"
+                elif note == "fits":
+                    icon = "✓"
+                elif note == "tight fit":
+                    icon = "⚠️"
+                else:
+                    icon = "✗"
+                st.caption(
+                    f"{icon} `{p.name}` — {p.size_gb:.1f} GB on disk"
+                    + (f" · {note}" if note not in ("loaded", "fits") else "")
+                )
+            st.caption(
+                "_Fit check is conservative: tight = within 10% of free VRAM. "
+                "Loaded models already pay their cost; switching swaps them out._"
+            )
+
+    if snap.source_notes:
+        with st.expander("ℹ️ Telemetry sources", expanded=False):
+            for note in snap.source_notes:
+                st.caption(f"• {note}")
+
+
 # ---------------------------------------------------------------- sidebar UI
 
 def render_sidebar() -> None:
@@ -413,6 +537,10 @@ def render_sidebar() -> None:
             st.markdown("**Attached:**")
             for d in ss.attached_docs:
                 st.caption(f"📎 {d['name']} (~{d['tokens']:,} tokens)")
+
+        st.divider()
+
+        render_gpu_panel()
 
         st.divider()
 

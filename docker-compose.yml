@@ -49,6 +49,14 @@ services:
       # model if this one isn't pulled. Must match Makefile's MODEL
       # variable so `make up-gpu` pulls and pre-warms the right model.
       DEFAULT_MODEL: ${DEFAULT_MODEL:-mistral-small3.1:24b}
+      # Optional GPU descriptors for the sidebar "GPU & Models" panel. We can't
+      # call nvidia-smi from inside the app container (the GPU is only passed
+      # through to the ollama container), so the operator provides these for
+      # display purposes. Set them in .env to match your hardware:
+      #   GPU_LABEL=NVIDIA L40S 48GB
+      #   TOTAL_VRAM_GB=48
+      GPU_LABEL: ${GPU_LABEL:-}
+      TOTAL_VRAM_GB: ${TOTAL_VRAM_GB:-}
     restart: unless-stopped
 
 volumes:
