@@ -1,0 +1,1018 @@
+"""Deterministic report generation.
+
+Each ReportSpec wires a chip label → a Python data-gathering function →
+a markdown formatting prompt. The chip-click handler in app.py runs the
+gather step, embeds the resulting summary dict in the formatting prompt,
+and feeds the prompt through the orchestrator's `run_format_turn`, which
+streams a single completion *without* exposing tools. The model can only
+format, not call APIs — which eliminates the failure mode where small
+tool-calling models narrate JSON tool calls as text or hit MAX_TOOL_ROUNDS.
+
+To add a new report:
+  1. Write a `gather_<name>_data(mcp, progress)` function that returns a
+     compact summary dict (counts, joins, tallies — all done in Python).
+  2. Write a `format_<name>_prompt(data)` function that produces a prompt
+     the model can render as markdown.
+  3. Add a `ReportSpec` entry to `PRESET_REPORTS`.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from mcp_client import IntersightMCPClient
+
+
+def _log(msg: str) -> None:
+    """Diagnostic logging surfaced in `make logs`."""
+    print(f"[reports] {msg}", file=sys.stderr, flush=True)
+
+
+# A tiny callback that the gather step calls between tools so the UI can
+# update its status indicator. `None` means "no UI; ignore."
+ProgressCb = Callable[[str], None] | None
+
+
+@dataclass
+class ReportSpec:
+    label: str          # Chip button label.
+    slug: str           # Stable key used in PDF filenames and component keys.
+    user_message: str   # Short, friendly user-turn message shown in chat.
+    gather: Callable[[IntersightMCPClient, ProgressCb], dict[str, Any]]
+    format_prompt: Callable[[dict[str, Any]], str]
+
+
+# A focused system prompt for the format-only step. The default chat
+# SYSTEM_PROMPT is about tool-call discipline, OData rules, etc. — none of
+# which apply when the model is just rendering pre-built data.
+FORMATTER_SYSTEM_PROMPT = """\
+You are a report formatter for a Cisco Intersight administration tool.
+Your ONLY job is to render the JSON data in the user message as a clean
+markdown report.
+
+Rules:
+- Reply in English only.
+- Output ONLY the markdown report — no preamble, no commentary, no sign-off.
+- Use markdown tables (pipe syntax) for tabular data.
+- Use the exact section structure and order given in the user message.
+- Do NOT invent fields, counts, or values. Every number you write must
+  come from the JSON data in the user message.
+- Do NOT call any tools — none are available. All data is already present.
+"""
+
+
+# ---------------------------------------------------------------- helpers
+
+def _call_tool(
+    mcp: IntersightMCPClient,
+    name: str,
+    args: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Call an MCP list-style tool and return its results array.
+
+    The Intersight MCP server wraps responses as:
+      {"ok": true, "status": 200, "data": {"Results": [...], ...}}
+    Errors come back as:
+      {"ok": false, "status": 4xx, "error": "...", "data": {...}}
+
+    Returns an empty list on any error (tool failure, JSON parse failure,
+    `ok: false`, unexpected shape) and logs a diagnostic line so blank
+    reports are easy to debug from `make logs`.
+    """
+    try:
+        res = mcp.call_tool(name, args or {})
+        if res.is_error or not res.text:
+            _log(f"{name}: tool error or empty response")
+            return []
+        parsed = json.loads(res.text)
+    except Exception as exc:
+        _log(f"{name}: call failed: {exc}")
+        return []
+
+    if not isinstance(parsed, dict):
+        _log(f"{name}: unexpected top-level shape {type(parsed).__name__}")
+        return []
+    if parsed.get("ok") is False:
+        _log(f"{name}: ok=false error={parsed.get('error')!r}")
+        return []
+
+    data = parsed.get("data")
+    if isinstance(data, dict) and isinstance(data.get("Results"), list):
+        return data["Results"]
+    if isinstance(data, list):
+        return data
+    _log(f"{name}: no Results array in response (data keys: {list(data) if isinstance(data, dict) else type(data).__name__})")
+    return []
+
+
+def _tally(items: list[dict[str, Any]], field: str, *, default: str = "Unknown") -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for item in items:
+        value = item.get(field)
+        counter[value if value else default] += 1
+    # Preserve highest-count-first order; the formatter shows them in that order.
+    return dict(counter.most_common())
+
+
+def _percent(part: int, total: int) -> int:
+    return round(100 * part / total) if total else 0
+
+
+# ---------------------------------------------------------------- inventory: gather
+
+# OperState values that count as "healthy" for the needs-attention table.
+# Intersight uses different casings across resource types, so cover both.
+_HEALTHY_OPER_STATES = {
+    "Operable", "operable", "Healthy", "healthy", "ok", "Ok", "OK",
+}
+
+
+# Total slots per chassis model. Intersight does NOT expose total slot count
+# on equipment.Chassis (NumSlots is often empty or 0 for X-Series), so we keep
+# our own table here. If a chassis model isn't in this table, slot math falls
+# back to NumSlots (if present) then to the highest SlotId observed across
+# the fleet. Extend this table as new chassis models are encountered.
+KNOWN_CAPACITY = {
+    "UCSX-9508":     8,   # X-Series chassis
+    "UCSB-5108-AC2": 8,   # B-Series chassis (8 half-width or 4 full-width)
+}
+
+
+def gather_inventory_data(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
+    """Pull every Intersight resource needed for the inventory report and
+    roll the raw data into a compact summary dict.
+
+    All counts, joins, and percentages happen here in Python, so the LLM's
+    only job is to render the dict as markdown.
+    """
+    def step(label: str) -> None:
+        if progress is not None:
+            progress(label)
+
+    # NOTE: do NOT pass an explicit `select` for blades or rack units. The
+    # MCP server's default-select path fetches the full response and trims
+    # in Python, which preserves the `Chassis` reference's nested `Moid` so
+    # the blade -> chassis join works. An explicit `$select=Chassis` against
+    # the live API returns a stripped reference shape without `Moid`, which
+    # silently breaks the join (every chassis shows 0 used). OperState is
+    # now in the MCP server's defaultSelect for both blades and rack units,
+    # so we don't need a custom select to surface it either.
+    step("Querying chassis…")
+    chassis = _call_tool(mcp, "get_chassis", {"top": 200})
+    step("Querying blade servers…")
+    blades = _call_tool(mcp, "get_compute_blades", {"top": 500})
+    step("Querying rack servers…")
+    rack_units = _call_tool(mcp, "get_compute_rack_units", {"top": 500})
+    step("Querying PCIe nodes…")
+    # X-Series PCIe nodes (e.g. UCSX-440P) occupy chassis slots but don't
+    # reference a chassis directly — they reference their paired blade via
+    # ComputeBlade. Two-hop join: pci.Node -> compute.Blade -> chassis.
+    pcie_nodes = _call_tool(mcp, "get_pci_nodes", {"top": 500})
+    step("Querying fabric interconnects…")
+    fis = _call_tool(mcp, "get_fabric_interconnects", {"top": 200})
+    step("Querying server profiles…")
+    profiles = _call_tool(mcp, "get_server_profiles", {"top": 500})
+    step("Querying alarm summary…")
+    alarms_raw = _call_tool(mcp, "get_alarm_summary", {})
+    step("Querying HCL status…")
+    hcl = _call_tool(mcp, "get_hcl_status", {"top": 500})
+
+    _log(
+        f"inventory gather: chassis={len(chassis)} blades={len(blades)} "
+        f"rack_units={len(rack_units)} pcie_nodes={len(pcie_nodes)} "
+        f"fis={len(fis)} profiles={len(profiles)} "
+        f"alarm_buckets={len(alarms_raw)} hcl={len(hcl)}"
+    )
+
+    # One-shot diagnostic: dump the first FI's populated (non-empty) fields
+    # so we can find which key holds the hostname the user sees in the
+    # Intersight UI. Remove once the FI display-name fallback chain is right.
+    if fis:
+        sample = {k: v for k, v in fis[0].items() if v not in (None, "", [], {})}
+        _log(f"first fi populated fields: {json.dumps(sample, default=str)[:1500]}")
+
+    # ---- Aggregations
+    all_servers = list(blades) + list(rack_units)
+    total = len(all_servers)
+
+    # ---- Slot-occupancy join (blades + PCIe nodes).
+    #
+    # 1. Blades reference a chassis directly. Modern Intersight uses
+    #    `EquipmentChassis`; older payloads use `Chassis`. Check both.
+    # 2. PCIe nodes (UCSX-440P etc.) do NOT reference a chassis directly.
+    #    They reference their paired blade via `ComputeBlade` (with `Parent`
+    #    as a fallback). Two-hop join: PCIe node -> blade -> chassis.
+    # 3. Both types share the same physical slot pool, so used = blades + PCIe.
+    def _ref_moid(item: dict[str, Any], *keys: str) -> str | None:
+        for k in keys:
+            ref = item.get(k)
+            if isinstance(ref, dict) and ref.get("Moid"):
+                return ref["Moid"]
+        return None
+
+    blades_per_chassis: Counter[str] = Counter()
+    blade_to_chassis: dict[str, str] = {}
+    for b in blades:
+        chassis_moid = _ref_moid(b, "EquipmentChassis", "Chassis")
+        if chassis_moid:
+            blades_per_chassis[chassis_moid] += 1
+            blade_moid = b.get("Moid")
+            if blade_moid:
+                blade_to_chassis[blade_moid] = chassis_moid
+
+    pcie_per_chassis: Counter[str] = Counter()
+    for node in pcie_nodes:
+        # Resolve PCIe node -> paired blade -> chassis.
+        paired_blade_moid = _ref_moid(node, "ComputeBlade", "Parent")
+        chassis_moid = blade_to_chassis.get(paired_blade_moid) if paired_blade_moid else None
+        if chassis_moid:
+            pcie_per_chassis[chassis_moid] += 1
+
+    # Capacity per chassis model: KNOWN_CAPACITY first (authoritative), then
+    # NumSlots from the chassis MO (often missing for X-Series, hence the
+    # table), then highest observed SlotId for that model in the fleet as a
+    # last-resort lower bound.
+    observed_max_slot: dict[str, int] = {}
+    for c in chassis:
+        model = c.get("Model") or "Unknown"
+        moid = c.get("Moid")
+        # Walk every occupant of this chassis. SlotId is int on blades and
+        # str on PCIe nodes — coerce defensively.
+        occupant_slots: list[int] = []
+        for b in blades:
+            if _ref_moid(b, "EquipmentChassis", "Chassis") == moid:
+                try:
+                    occupant_slots.append(int(b.get("SlotId") or 0))
+                except (TypeError, ValueError):
+                    pass
+        for node in pcie_nodes:
+            paired = _ref_moid(node, "ComputeBlade", "Parent")
+            if blade_to_chassis.get(paired) == moid:
+                try:
+                    occupant_slots.append(int(node.get("SlotId") or 0))
+                except (TypeError, ValueError):
+                    pass
+        if occupant_slots:
+            observed_max_slot[model] = max(
+                observed_max_slot.get(model, 0), max(occupant_slots)
+            )
+
+    def _capacity_for(model: str, num_slots_field: int) -> int:
+        if model in KNOWN_CAPACITY:
+            return KNOWN_CAPACITY[model]
+        if num_slots_field > 0:
+            return num_slots_field
+        return observed_max_slot.get(model, 0)
+
+    chassis_rows = []
+    for c in chassis:
+        moid = c.get("Moid")
+        model = c.get("Model") or "Unknown"
+        num_slots_field = int(c.get("NumSlots") or 0)
+        blade_count = blades_per_chassis.get(moid, 0)
+        pcie_count = pcie_per_chassis.get(moid, 0)
+        used = blade_count + pcie_count
+        total = _capacity_for(model, num_slots_field)
+        # Defensive: if reality exceeds our table, trust reality.
+        if total and used > total:
+            total = used
+        chassis_rows.append({
+            "name": c.get("Name") or "(unnamed)",
+            "model": model,
+            "oper_state": c.get("OperState") or "Unknown",
+            "num_slots": total,
+            "slots_used": used,
+            "slots_used_blades": blade_count,
+            "slots_used_pcie": pcie_count,
+            "slots_free": max(total - used, 0) if total else 0,
+            "capacity_known": total > 0,
+        })
+    chassis_rows.sort(key=lambda x: x["name"])
+
+    power_tally = _tally(all_servers, "OperPowerState")
+    oper_tally = _tally(all_servers, "OperState")
+    model_tally = _tally(all_servers, "Model")
+
+    needs_attention = []
+    for s in all_servers:
+        if (s.get("OperState") or "Unknown") not in _HEALTHY_OPER_STATES:
+            ch_ref = s.get("Chassis")
+            ch_name = ch_ref.get("Name") if isinstance(ch_ref, dict) else None
+            needs_attention.append({
+                "name": s.get("Name") or "(unnamed)",
+                "model": s.get("Model") or "Unknown",
+                "oper_state": s.get("OperState") or "Unknown",
+                "power_state": s.get("OperPowerState") or "Unknown",
+                "chassis": ch_name or "N/A",
+            })
+
+    def _fi_display_name(fi: dict[str, Any]) -> str:
+        """Best-effort identifier for a fabric interconnect.
+
+        The admin-configured Name is often empty; in that case fall back to
+        Hostname, then to a synthesized 'FI-A' / 'FI-B' from Switchid (which
+        is reliably populated), and finally to the Dn. Returns '(unnamed)'
+        only when none of those are present.
+        """
+        if fi.get("Name"):
+            return fi["Name"]
+        if fi.get("Hostname"):
+            return fi["Hostname"]
+        switchid = fi.get("Switchid")
+        if switchid:
+            return f"FI-{switchid}"
+        if fi.get("Dn"):
+            return fi["Dn"]
+        return "(unnamed)"
+
+    fi_rows = [
+        {
+            "name": _fi_display_name(f),
+            "model": f.get("Model") or "Unknown",
+            "serial": f.get("Serial") or "",
+            "oper_state": f.get("OperState") or "Unknown",
+        }
+        for f in fis
+    ]
+
+    assigned = [p for p in profiles if p.get("AssignedServer")]
+    unassigned = [p for p in profiles if not p.get("AssignedServer")]
+
+    # get_alarm_summary returns [{"Severity": "Critical", "Count": N}, …]
+    alarm_counts: dict[str, int] = {}
+    for entry in alarms_raw:
+        sev = entry.get("Severity") or "Unknown"
+        cnt = entry.get("Count") or entry.get("count") or 0
+        alarm_counts[sev] = int(cnt)
+
+    hcl_counts = _tally(hcl, "Status")
+
+    return {
+        "servers": {
+            "total": total,
+            "blades": len(blades),
+            "rack_units": len(rack_units),
+            "by_power_state": [
+                {"state": k, "count": v, "percent": _percent(v, total)}
+                for k, v in power_tally.items()
+            ],
+            "by_oper_state": [
+                {"state": k, "count": v, "percent": _percent(v, total)}
+                for k, v in oper_tally.items()
+            ],
+            "top_models": [
+                {"model": k, "count": v}
+                for k, v in list(model_tally.items())[:5]
+            ],
+            "needs_attention": needs_attention,
+        },
+        "chassis": {
+            "total": len(chassis_rows),
+            "rows": chassis_rows,
+            "total_slots": sum(r["num_slots"] for r in chassis_rows),
+            "slots_used": sum(r["slots_used"] for r in chassis_rows),
+            "slots_used_blades": sum(r["slots_used_blades"] for r in chassis_rows),
+            "slots_used_pcie": sum(r["slots_used_pcie"] for r in chassis_rows),
+            "slots_free": sum(r["slots_free"] for r in chassis_rows),
+            "any_unknown_capacity": any(not r["capacity_known"] for r in chassis_rows),
+        },
+        "fabric_interconnects": {
+            "total": len(fi_rows),
+            "rows": fi_rows,
+        },
+        "server_profiles": {
+            "total": len(profiles),
+            "assigned": len(assigned),
+            "unassigned": len(unassigned),
+            "unassigned_names": [p.get("Name") or "(unnamed)" for p in unassigned[:10]],
+            "unassigned_truncated": max(len(unassigned) - 10, 0),
+        },
+        "alarms": alarm_counts,
+        "hcl": hcl_counts,
+    }
+
+
+# ---------------------------------------------------------------- inventory: format
+
+# We pre-compute the executive-summary one-liners in Python so the model
+# doesn't have to interpolate them from the JSON — that's the most error-prone
+# part for smaller models.
+_INVENTORY_FORMAT_TEMPLATE = """\
+You will format the following Intersight inventory data as a clear, scannable
+markdown report. The data is already gathered and pre-computed; you do NOT
+need to call any tools and you do NOT need to compute totals or percentages
+yourself. Just render the data using the structure below.
+
+PRE-COMPUTED DATA (use this as the source of truth):
+```json
+{data_json}
+```
+
+OUTPUT — produce markdown matching this structure exactly. Use the values
+from the JSON data above. No commentary, no preamble, no sign-off.
+
+# Intersight Inventory Report
+
+## Executive Summary
+- **Servers:** {total} total ({blades} blades, {rack_units} rack units)
+- **Power state:** {power_summary}
+- **Health:** {health_summary}
+- **Chassis:** {chassis_total} chassis with {slots_used}/{total_slots} slots used ({slots_free} free; {slots_used_blades} blades + {slots_used_pcie} PCIe nodes)
+- **Fabric interconnects:** {fi_total}
+- **Server profiles:** {assigned}/{profile_total} assigned ({unassigned} unassigned)
+- **Active alarms:** {alarms_summary}
+- **HCL compliance:** {hcl_summary}
+
+## Servers
+
+### By power state
+Render `servers.by_power_state` as a markdown table with columns: State | Count | %.
+
+### By operational state
+Render `servers.by_oper_state` as a markdown table with columns: State | Count | %.
+
+### Top server models
+Render `servers.top_models` as a markdown table with columns: Model | Count.
+
+### Servers needing attention
+If `servers.needs_attention` is non-empty, render it as a markdown table with
+columns: Name | Model | OperState | PowerState | Chassis. Otherwise write
+the single line: **All servers are healthy.**
+
+## Chassis
+If `chassis.total` > 0, render `chassis.rows` as a markdown table with
+columns: Name | Model | OperState | Total Slots | Blades | PCIe Nodes |
+Slots Free. The Blades column comes from `slots_used_blades`, PCIe Nodes
+from `slots_used_pcie`. Both occupy chassis slots; their sum is `slots_used`.
+If `chassis.any_unknown_capacity` is true, add this italic line under the
+table: *Total Slots = "0" indicates the chassis model isn't in the
+KNOWN_CAPACITY table; extend reports.py to fix.*
+Otherwise (no chassis at all), write the single line:
+**No chassis present (rack-only environment).**
+
+## Fabric Interconnects
+If `fabric_interconnects.total` > 0, render `fabric_interconnects.rows` as a
+markdown table with columns: Name | Model | Serial | OperState. Otherwise
+write the single line: **No fabric interconnects present.**
+
+## Server Profiles
+- Total: {profile_total}
+- Assigned: {assigned}
+- Unassigned: {unassigned}
+
+If `server_profiles.unassigned_names` is non-empty, list each name as a
+bullet under an indented sub-list. If `server_profiles.unassigned_truncated`
+is greater than zero, add a final bullet: *…and N more (first 10 shown)*
+where N is that value.
+
+## Active Alarms
+Render `alarms` as a bullet list of `severity: count`. If empty write:
+**No active alarms.**
+
+## HCL Compliance
+Render `hcl` as a bullet list of `status: count`. If empty write:
+**HCL data unavailable.**
+"""
+
+
+def format_inventory_prompt(data: dict[str, Any]) -> str:
+    s = data["servers"]
+    c = data["chassis"]
+    p = data["server_profiles"]
+    alarms = data["alarms"]
+    hcl = data["hcl"]
+
+    def _join(pairs: list[tuple[str, int]]) -> str:
+        return ", ".join(f"{count} {label}" for label, count in pairs)
+
+    power_summary = _join(
+        [(r["state"], r["count"]) for r in s["by_power_state"]]
+    ) or "n/a"
+    health_summary = _join(
+        [(r["state"], r["count"]) for r in s["by_oper_state"]]
+    ) or "n/a"
+    alarms_summary = _join(
+        [(sev.lower(), cnt) for sev, cnt in alarms.items()]
+    ) or "none"
+    hcl_summary = _join(
+        [(status.lower(), cnt) for status, cnt in hcl.items()]
+    ) or "n/a"
+
+    return _INVENTORY_FORMAT_TEMPLATE.format(
+        data_json=json.dumps(data, indent=2),
+        total=s["total"],
+        blades=s["blades"],
+        rack_units=s["rack_units"],
+        power_summary=power_summary,
+        health_summary=health_summary,
+        chassis_total=c["total"],
+        slots_used=c["slots_used"],
+        slots_used_blades=c["slots_used_blades"],
+        slots_used_pcie=c["slots_used_pcie"],
+        total_slots=c["total_slots"],
+        slots_free=c["slots_free"],
+        fi_total=data["fabric_interconnects"]["total"],
+        profile_total=p["total"],
+        assigned=p["assigned"],
+        unassigned=p["unassigned"],
+        alarms_summary=alarms_summary,
+        hcl_summary=hcl_summary,
+    )
+
+
+# ---------------------------------------------------------------- registry
+
+INVENTORY_REPORT = ReportSpec(
+    label="📦 Inventory Report",
+    slug="inventory",
+    user_message="Generate an Intersight inventory report.",
+    gather=gather_inventory_data,
+    format_prompt=format_inventory_prompt,
+)
+
+
+PRESET_REPORTS: dict[str, ReportSpec] = {
+    INVENTORY_REPORT.label: INVENTORY_REPORT,
+}
+
+
+# ============================================================================
+# Demo chat routes — deterministic gather + LLM format for three high-value
+# prompts that we want to behave consistently regardless of which model is
+# loaded. Architecture identical to the Inventory Report preset: Python
+# gathers and computes everything, the model only formats the pre-built
+# data as markdown. None of the chat-side tool-routing rules apply on this
+# path because the model is never given any tools.
+#
+# Triggered automatically when the user's typed prompt matches one of the
+# trigger phrases in CHAT_ROUTES below. Anything that doesn't match falls
+# through to the normal model-driven chat path.
+# ============================================================================
+
+
+def _ref_moid_top(item: dict[str, Any], *keys: str) -> str | None:
+    """Module-scope mirror of the nested helper in gather_inventory_data.
+
+    Duplicated rather than hoisted to keep gather_inventory_data's diff
+    surface small — its inner helper has a comment block tied to context.
+    """
+    for k in keys:
+        ref = item.get(k)
+        if isinstance(ref, dict) and ref.get("Moid"):
+            return ref["Moid"]
+    return None
+
+
+# ---------------------------------------------------------------- chassis details
+
+def gather_chassis_details(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
+    """Gather chassis + blades + PCIe nodes; compute per-chassis slot
+    occupancy AND a per-slot occupancy map in Python so the model can't
+    mis-do the arithmetic or the slot-by-slot rendering."""
+
+    def step(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    step("Querying chassis…")
+    chassis = _call_tool(mcp, "get_chassis", {"top": 200})
+    step("Querying blade servers…")
+    blades = _call_tool(mcp, "get_compute_blades", {"top": 500})
+    step("Querying PCIe nodes…")
+    pcie_nodes = _call_tool(mcp, "get_pci_nodes", {"top": 500})
+
+    # Build joins: blade -> chassis, then PCIe -> paired blade -> chassis.
+    blades_per_chassis: Counter[str] = Counter()
+    blade_to_chassis: dict[str, str] = {}
+    for b in blades:
+        chassis_moid = _ref_moid_top(b, "EquipmentChassis", "Chassis")
+        if chassis_moid:
+            blades_per_chassis[chassis_moid] += 1
+            blade_moid = b.get("Moid")
+            if blade_moid:
+                blade_to_chassis[blade_moid] = chassis_moid
+
+    pcie_per_chassis: Counter[str] = Counter()
+    for node in pcie_nodes:
+        paired = _ref_moid_top(node, "ComputeBlade", "Parent")
+        if paired and paired in blade_to_chassis:
+            pcie_per_chassis[blade_to_chassis[paired]] += 1
+
+    # Per-chassis slot occupancy map. Keyed by chassis Moid; inner dict
+    # maps integer slot_id -> occupant descriptor. We do this in Python
+    # so the model only has to render the table, not derive it.
+    blade_by_moid: dict[str, dict[str, Any]] = {
+        b["Moid"]: b for b in blades if b.get("Moid")
+    }
+    slots_by_chassis: dict[str, dict[int, dict[str, Any]]] = {}
+
+    def _slot_id(item: dict[str, Any]) -> int | None:
+        raw = item.get("SlotId")
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    for b in blades:
+        chassis_moid = _ref_moid_top(b, "EquipmentChassis", "Chassis")
+        if chassis_moid is None:
+            continue
+        slot_id = _slot_id(b)
+        if slot_id is None:
+            continue
+        slots_by_chassis.setdefault(chassis_moid, {})[slot_id] = {
+            "type": "Blade",
+            "name": b.get("Name") or "(unnamed)",
+            "model": b.get("Model") or "Unknown",
+            "serial": b.get("Serial") or "",
+            "power": (b.get("OperPowerState") or b.get("AdminPowerState") or "").lower() or "-",
+        }
+
+    for node in pcie_nodes:
+        paired = _ref_moid_top(node, "ComputeBlade", "Parent")
+        chassis_moid = blade_to_chassis.get(paired) if paired else None
+        if chassis_moid is None:
+            continue
+        slot_id = _slot_id(node)
+        if slot_id is None:
+            continue
+        # PCIe nodes often have an empty Name; fall back to the paired
+        # blade's name with a "(PCIe)" suffix so the user can see what
+        # the node is tied to.
+        node_name = node.get("Name") or ""
+        if not node_name and paired:
+            paired_blade = blade_by_moid.get(paired)
+            if paired_blade:
+                bname = paired_blade.get("Name") or "(unnamed)"
+                node_name = f"{bname} (PCIe)"
+        if not node_name:
+            node_name = "(PCIe)"
+        slots_by_chassis.setdefault(chassis_moid, {})[slot_id] = {
+            "type": "PCIe",
+            "name": node_name,
+            "model": node.get("Model") or "Unknown",
+            "serial": node.get("Serial") or "",
+            "power": "-",
+        }
+
+    rows: list[dict[str, Any]] = []
+    for c in chassis:
+        moid = c.get("Moid")
+        num_slots = int(c.get("NumSlots") or 0)
+        if num_slots == 0:
+            num_slots = KNOWN_CAPACITY.get(c.get("Model") or "", 0)
+        blade_count = blades_per_chassis.get(moid, 0) if moid else 0
+        pcie_count = pcie_per_chassis.get(moid, 0) if moid else 0
+        used = blade_count + pcie_count
+        free = max(num_slots - used, 0) if num_slots else 0
+
+        # Build the per-slot occupancy list: one entry per slot from 1 to
+        # num_slots. Each entry has slot, type ("Blade" / "PCIe" /
+        # "(empty)"), name, model, serial, power. Done here so the format
+        # prompt is just a render of authoritative pre-computed data.
+        occupants = slots_by_chassis.get(moid, {}) if moid else {}
+        slot_map: list[dict[str, Any]] = []
+        for slot_num in range(1, max(num_slots, 1) + 1):
+            entry = occupants.get(slot_num)
+            if entry is None:
+                slot_map.append({
+                    "slot": slot_num,
+                    "type": "(empty)",
+                    "name": "",
+                    "model": "",
+                    "serial": "",
+                    "power": "",
+                })
+            else:
+                slot_map.append({"slot": slot_num, **entry})
+
+        rows.append({
+            "name": c.get("Name") or "(unnamed)",
+            "model": c.get("Model") or "Unknown",
+            "serial": c.get("Serial") or "",
+            "oper_state": c.get("OperState") or "Unknown",
+            "total_slots": num_slots,
+            "blades": blade_count,
+            "pcie_nodes": pcie_count,
+            "slots_used": used,
+            "slots_free": free,
+            "slot_map": slot_map,
+        })
+    rows.sort(key=lambda r: r["name"])
+    _log(f"chassis details gather: chassis={len(rows)} blades={len(blades)} pcie={len(pcie_nodes)}")
+    return {"chassis": rows}
+
+
+def format_chassis_details_prompt(data: dict[str, Any]) -> str:
+    rows = data["chassis"]
+    if not rows:
+        return _empty_template(
+            "Chassis Details",
+            "No chassis present in this environment.",
+        )
+    return f"""\
+You will format pre-computed chassis data as a clean markdown report.
+All values below are authoritative — render them exactly as given, do
+NOT invent, modify, or omit any. Reply in English only.
+
+PRE-COMPUTED DATA (JSON):
+```json
+{json.dumps(rows, indent=2)}
+```
+
+OUTPUT — produce exactly this structure with no commentary, preamble,
+or sign-off:
+
+# Chassis Details
+
+First, a SUMMARY table (pipe syntax) with EXACTLY these columns in this
+order, one row per chassis:
+| Name | Model | Serial | OperState | Total Slots | Slots Used | Slots Free |
+
+For the "Slots Used" column, render the value as
+"<blades> blades + <pcie_nodes> PCIe = <slots_used>", e.g.
+"3 blades + 2 PCIe = 5".
+
+Then, for EACH chassis above (in the order it appears), a SLOT MAP
+section: a level-2 heading containing the chassis name followed by
+" — Slot Map", and a markdown table with EXACTLY these columns in this
+order:
+| Slot | Type | Name | Model | Serial | Power |
+
+Render one row per entry in that chassis's "slot_map" array, in slot
+order. Include EVERY slot, including empty ones. For empty slots
+(where "type" is "(empty)") render the row as:
+| <slot> | (empty) |  |  |  |  |
+
+Example of the overall structure for two chassis:
+
+# Chassis Details
+
+| Name | Model | Serial | OperState | Total Slots | Slots Used | Slots Free |
+|---|---|---|---|---|---|---|
+| chassis-a | UCSX-9508 | SERIAL-A | OK | 8 | 3 blades + 2 PCIe = 5 | 3 |
+| chassis-b | UCSX-9508 | SERIAL-B | OK | 8 | 4 blades + 0 PCIe = 4 | 4 |
+
+## chassis-a — Slot Map
+
+| Slot | Type | Name | Model | Serial | Power |
+|---|---|---|---|---|---|
+| 1 | Blade | name-1 | UCSX-210C-M7 | FCH... | on |
+| 2 | PCIe | name-1 (PCIe) | UCSX-440P |  | - |
+| 3 | (empty) |  |  |  |  |
+| ... | ... | ... | ... | ... | ... |
+
+## chassis-b — Slot Map
+
+| Slot | Type | Name | Model | Serial | Power |
+|---|---|---|---|---|---|
+| 1 | ... | ... | ... | ... | ... |
+"""
+
+
+# ---------------------------------------------------------------- server details
+
+def gather_server_details(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
+    def step(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    step("Querying physical servers…")
+    servers = _call_tool(mcp, "get_physical_servers", {"top": 500})
+
+    def _mb(v: Any) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    rows: list[dict[str, Any]] = [
+        {
+            "name": s.get("Name") or "(unnamed)",
+            "model": s.get("Model") or "Unknown",
+            "serial": s.get("Serial") or "",
+            "vendor": s.get("Vendor") or "",
+            "mgmt_mode": s.get("ManagementMode") or "",
+            "power": s.get("OperPowerState") or s.get("AdminPowerState") or "Unknown",
+            "cpus": s.get("NumCpus") or 0,
+            "threads": s.get("NumThreads") or 0,
+            "memory_mb": _mb(s.get("TotalMemory")),
+        }
+        for s in servers
+    ]
+    rows.sort(key=lambda r: r["name"])
+    _log(f"server details gather: servers={len(rows)}")
+    return {"servers": rows}
+
+
+def format_server_details_prompt(data: dict[str, Any]) -> str:
+    rows = data["servers"]
+    if not rows:
+        return _empty_template(
+            "Server Details",
+            "No physical servers found in this environment.",
+        )
+    return f"""\
+You will format pre-computed server inventory data as a clean markdown
+report. All values below are authoritative — render them exactly,
+do NOT invent or modify any. Reply in English only.
+
+PRE-COMPUTED DATA (JSON):
+```json
+{json.dumps(rows, indent=2)}
+```
+
+OUTPUT — produce exactly this structure with no commentary, preamble,
+or sign-off:
+
+# Server Details
+
+A markdown table (pipe syntax) with EXACTLY these columns in this order:
+| Name | Model | Serial | Vendor | Mgmt Mode | Power | CPUs | Threads | Memory (MB) |
+
+Render every row from the JSON above. Use the field mappings:
+name->Name, model->Model, serial->Serial, vendor->Vendor,
+mgmt_mode->Mgmt Mode, power->Power, cpus->CPUs, threads->Threads,
+memory_mb->Memory (MB).
+"""
+
+
+# ---------------------------------------------------------------- alarms
+
+# Severity ordering for sort — Intersight values vary in case across versions.
+_SEVERITY_RANK = {
+    "Critical": 0, "critical": 0,
+    "Warning": 1, "warning": 1,
+    "Info": 2, "info": 2,
+    "Cleared": 3, "cleared": 3,
+}
+
+
+def gather_alarm_details(mcp: IntersightMCPClient, progress: ProgressCb = None) -> dict[str, Any]:
+    def step(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    step("Querying active alarms…")
+    # Don't pass orderby — Intersight's $orderby on alarms can 400 on some
+    # field combinations. Sort client-side instead.
+    alarms = _call_tool(mcp, "get_alarms", {"top": 200})
+
+    rows: list[dict[str, Any]] = [
+        {
+            "name": a.get("Name") or "",
+            "severity": a.get("Severity") or "Unknown",
+            "code": a.get("Code") or "",
+            "affected": (
+                a.get("AffectedMoDisplayName")
+                or a.get("AffectedObjectType")
+                or ""
+            ),
+            "description": a.get("Description") or "",
+            "created": a.get("CreationTime") or "",
+        }
+        for a in alarms
+    ]
+    rows.sort(
+        key=lambda r: (
+            _SEVERITY_RANK.get(r["severity"], 9),
+            # Reverse-sort time: invert via string compare on ISO timestamp.
+            # Negation isn't valid on str, so leverage that ISO timestamps
+            # sort lexicographically: prepend a high marker so empty -> last.
+            r["created"] or "",
+        ),
+        reverse=False,
+    )
+    _log(f"alarm details gather: alarms={len(rows)}")
+    return {"alarms": rows}
+
+
+def format_alarm_details_prompt(data: dict[str, Any]) -> str:
+    rows = data["alarms"]
+    if not rows:
+        return _empty_template("Active Alarms", "No active alarms.")
+    return f"""\
+You will format pre-computed alarm data as a clean markdown report.
+All values below are authoritative — render them exactly, do NOT
+invent or modify any. Reply in English only.
+
+PRE-COMPUTED DATA (JSON):
+```json
+{json.dumps(rows, indent=2)}
+```
+
+OUTPUT — produce exactly this structure with no commentary, preamble,
+or sign-off:
+
+# Active Alarms
+
+A markdown table (pipe syntax) with EXACTLY these columns in this order:
+| Severity | Name | Affected | Description | Created |
+
+Render every row from the JSON above in the order shown (already
+sorted by severity).
+"""
+
+
+# ---------------------------------------------------------------- empty case
+
+def _empty_template(title: str, body: str) -> str:
+    """For empty data, give the model an unambiguous template to echo.
+
+    Eliminates the "header-only table stub" failure mode by giving the
+    model only one valid output: a heading + a short factual sentence.
+    """
+    return f"""\
+You will produce EXACTLY this output and nothing else — no preamble,
+no commentary, no sign-off. Reply in English only.
+
+OUTPUT:
+
+# {title}
+
+{body}
+"""
+
+
+# ---------------------------------------------------------------- chat routing
+
+CHASSIS_DETAILS_SPEC = ReportSpec(
+    label="Chassis Details",
+    slug="chassis",
+    user_message="list chassis details",
+    gather=gather_chassis_details,
+    format_prompt=format_chassis_details_prompt,
+)
+
+SERVER_DETAILS_SPEC = ReportSpec(
+    label="Server Details",
+    slug="servers",
+    user_message="list server details",
+    gather=gather_server_details,
+    format_prompt=format_server_details_prompt,
+)
+
+ALARM_DETAILS_SPEC = ReportSpec(
+    label="Active Alarms",
+    slug="alarms",
+    user_message="list alarms and descriptions",
+    gather=gather_alarm_details,
+    format_prompt=format_alarm_details_prompt,
+)
+
+
+@dataclass
+class ChatRoute:
+    """A mapping from user-prompt trigger phrases to a deterministic
+    ReportSpec. The first route whose trigger appears as a substring of
+    the (lowercased, stripped) user prompt wins; the chat is routed
+    through handle_preset_report instead of the model-driven chat loop.
+    """
+
+    triggers: tuple[str, ...]
+    spec: ReportSpec
+
+
+# Order matters — earlier routes win. Triggers are matched case-insensitively
+# against the lowercased prompt.
+CHAT_ROUTES: list[ChatRoute] = [
+    ChatRoute(
+        triggers=(
+            "list chassis detail", "chassis detail", "chassis info",
+            "list chassis", "show chassis", "show me chassis",
+        ),
+        spec=CHASSIS_DETAILS_SPEC,
+    ),
+    ChatRoute(
+        triggers=(
+            "list server detail", "server detail", "server details",
+            "list servers", "show servers", "show me servers",
+            "list server info", "server info",
+        ),
+        spec=SERVER_DETAILS_SPEC,
+    ),
+    ChatRoute(
+        triggers=(
+            "list alarms and descriptions",
+            "list alarm", "show alarm", "alarm detail", "alarm description",
+            "show me alarms", "list alarms",
+        ),
+        spec=ALARM_DETAILS_SPEC,
+    ),
+]
+
+
+def match_chat_route(prompt: str) -> ReportSpec | None:
+    """Return the deterministic ReportSpec for `prompt`, or None if no
+    trigger matches. Called from app.handle_user_message before the
+    model-driven chat path."""
+    lower = prompt.lower().strip()
+    for route in CHAT_ROUTES:
+        for trigger in route.triggers:
+            if trigger in lower:
+                return route.spec
+    return None
