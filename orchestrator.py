@@ -67,6 +67,19 @@ def _env_bool(name: str, default: bool) -> bool:
 # support silently ignore this option, so it's safe to send to all.
 THINKING_ENABLED = _env_bool("LLM_THINKING", True)
 
+# gpt-oss uses the OpenAI Harmony response format and rejects the boolean
+# `think` toggle in favor of a tri-state `reasoning_effort`. "low" gives
+# the snappiest tool-call responses; "medium"/"high" trade speed for
+# deeper analysis. Other models ignore this field, so it's safe to send.
+REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low").strip().lower()
+if REASONING_EFFORT not in {"low", "medium", "high"}:
+    print(
+        f"[orchestrator] WARN: LLM_REASONING_EFFORT={REASONING_EFFORT!r} "
+        f"is not low/medium/high, falling back to 'low'",
+        file=sys.stderr, flush=True,
+    )
+    REASONING_EFFORT = "low"
+
 # NOTE on context size: we deliberately do NOT send num_ctx here. Ollama's
 # OpenAI-compatible /v1/chat/completions endpoint silently drops the
 # nested options.num_ctx field (ollama/ollama#6286, #6544). The correct
@@ -74,19 +87,34 @@ THINKING_ENABLED = _env_bool("LLM_THINKING", True)
 # ollama container itself; see docker-compose.yml.
 
 
-def _build_extra_body() -> dict[str, Any]:
+def _is_gpt_oss(model: str) -> bool:
+    """gpt-oss family detector — name-prefix match handles both the
+    base `gpt-oss:20b` / `gpt-oss:120b` tags and any user-derived
+    Modelfile variants like `gpt-oss-fast:20b`."""
+    return (model or "").lower().startswith("gpt-oss")
+
+
+def _build_extra_body(model: str) -> dict[str, Any]:
     """Construct the `extra_body` dict for an Ollama chat request.
 
     Centralized so both the tool-call loop and the format-only path stay
-    in sync. Only fields Ollama's OpenAI-compat layer actually honors
-    are included: `keep_alive` (pin model in VRAM) and `think` (toggle
-    reasoning traces on supported models). Models that don't recognize a
-    field silently ignore it, so this is safe to send to every model.
+    in sync. Two model families need different reasoning-control fields:
+
+    * gpt-oss (OpenAI Harmony): rejects boolean `think` and instead
+      expects `reasoning_effort` ∈ {low, medium, high}. Per Ollama's
+      docs (docs/capabilities/thinking.mdx) this is hard-coded into
+      the model template — sending boolean `think` is silently ignored.
+    * Everything else: standard Ollama `think` boolean. Models that
+      don't support thinking ignore the field.
+
+    `keep_alive` pins the model in VRAM regardless of family.
     """
-    return {
-        "keep_alive": KEEP_ALIVE,
-        "think": THINKING_ENABLED,
-    }
+    body: dict[str, Any] = {"keep_alive": KEEP_ALIVE}
+    if _is_gpt_oss(model):
+        body["reasoning_effort"] = REASONING_EFFORT
+    else:
+        body["think"] = THINKING_ENABLED
+    return body
 
 
 def _log(msg: str) -> None:
@@ -510,6 +538,14 @@ class Orchestrator:
 
             round_started = time.perf_counter()
             content_buf = ""
+            # gpt-oss (and other Harmony-style reasoning models) emit
+            # their chain-of-thought on a separate `reasoning` channel
+            # from the user-visible `content`. We capture it but don't
+            # render it — it's still required on the assistant history
+            # entry that carries tool calls, otherwise gpt-oss loses its
+            # CoT on the next round and the final answer goes silent.
+            # See OpenAI's gpt-oss cookbook + ollama/ollama#12158, #12203.
+            reasoning_buf = ""
             tool_calls_acc: dict[int, dict[str, str]] = {}
             first_token_at: float | None = None
 
@@ -523,7 +559,7 @@ class Orchestrator:
                     temperature=TEMPERATURE,
                     stream=True,
                     stream_options={"include_usage": True},
-                    extra_body=_build_extra_body(),
+                    extra_body=_build_extra_body(model),
                 )
                 for chunk in stream:
                     # The usage chunk arrives at the end with an empty `choices`
@@ -539,6 +575,13 @@ class Orchestrator:
                             first_token_at = time.perf_counter()
                         content_buf += delta.content
                         emit(TurnEvent(kind="assistant_delta", text=delta.content))
+
+                    # `reasoning` is a non-standard OpenAI field; Ollama
+                    # surfaces it for gpt-oss / other thinking models.
+                    # Stays out of the visible stream by design.
+                    reasoning_delta = getattr(delta, "reasoning", None)
+                    if reasoning_delta:
+                        reasoning_buf += reasoning_delta
 
                     for tc_delta in (getattr(delta, "tool_calls", None) or []):
                         idx = tc_delta.index
@@ -617,6 +660,14 @@ class Orchestrator:
                     for tc in sorted_tcs
                 ],
             }
+            # Echo the captured CoT back to the model on the next round.
+            # Required for gpt-oss: per OpenAI's cookbook the model is
+            # "highly sensitive to chain-of-thought" and will hallucinate
+            # or return an empty final message if the reasoning that led
+            # to a tool call isn't preserved across subsequent samplings.
+            # Non-Harmony models silently ignore the field.
+            if reasoning_buf:
+                assistant_history_entry["reasoning"] = reasoning_buf
             messages.append(assistant_history_entry)
             history.append(assistant_history_entry)
 
@@ -769,7 +820,7 @@ class Orchestrator:
                 temperature=TEMPERATURE,
                 stream=True,
                 stream_options={"include_usage": True},
-                extra_body=_build_extra_body(),
+                extra_body=_build_extra_body(model),
             )
             for chunk in stream:
                 if getattr(chunk, "usage", None):

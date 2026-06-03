@@ -114,16 +114,24 @@ questions but slower and more VRAM.
 
 | Model | Origin | VRAM (approx) | When to pick |
 |---|---|---|---|
-| `mistral-small3.1:24b` | 🇫🇷 Mistral | ~14 GB | **Default.** Tuned for instruction following + function calling. Fits with headroom on L40S; ~25–35 tok/s. |
+| `gpt-oss:20b` | 🇺🇸 OpenAI | ~14 GB | **Default.** OpenAI's open-weight reasoning model (Aug 2025). Native OpenAI tool-call format, fast (~30–50 tok/s on L40S), Apache 2.0 licensed. |
+| `gpt-oss:120b` | 🇺🇸 OpenAI | ~65 GB | Larger sibling for deeper reasoning; needs >48 GB VRAM. |
+| `mistral-small3.1:24b` | 🇫🇷 Mistral | ~14 GB | Solid workhorse, well-tuned for function calling; ~25–35 tok/s. |
 | `qwen2.5:32b` | 🇨🇳 Alibaba | ~22 GB | Strong tool-call discipline; pick if no country-of-origin restrictions. |
 | `qwen2.5:14b` | 🇨🇳 Alibaba | ~10 GB | Smaller GPU option. |
 | `llama3.3:70b` | 🇺🇸 Meta | ~42 GB | Strongest open-weight non-Chinese option; slow on a single L40S (~5–8 tok/s). |
 | `qwen2.5:72b` | 🇨🇳 Alibaba | ~48 GB | Top tier, needs a full L40S / H100. |
 | `granite3.3:8b` | 🇺🇸 IBM | ~5 GB | Fast, decent tool calling; quality step down from 24B+. |
 
-The sidebar pre-selects `mistral-small3.1:24b` (the same model
-`make up-gpu` pulls and pre-warms). Override with `MODEL=` on the make
-line or via the `DEFAULT_MODEL` env var.
+The sidebar pre-selects `gpt-oss:20b` (the same model `make up-gpu`
+pulls and pre-warms). Override with `MODEL=` on the make line or via
+the `DEFAULT_MODEL` env var.
+
+gpt-oss uses OpenAI's Harmony response format, which the orchestrator
+handles automatically: it sends `reasoning_effort` (tunable via
+`LLM_REASONING_EFFORT=low|medium|high`) instead of the boolean `think`
+toggle other models use, and echoes the model's chain-of-thought back
+on multi-turn tool calls so the final answer doesn't go silent.
 
 Avoid `llama3.1:8b` — it's notably weak at multi-step tool use and tends
 to print tool calls as text instead of issuing them properly.

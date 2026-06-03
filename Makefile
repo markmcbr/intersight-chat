@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 COMPOSE ?= docker compose
-MODEL ?= mistral-small3.1:24b
+MODEL ?= gpt-oss:20b
 
 .PHONY: up up-gpu down restart logs ps status build pull-model ensure-default-model shell-app shell-ollama clean
 
