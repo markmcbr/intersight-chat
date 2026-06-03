@@ -422,8 +422,8 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        # ---------- Demo mode ----------
-        st.markdown("### 6. Demo Mode")
+        # ---------- Tool mode ----------
+        st.markdown("### 6. Tool Mode")
         ss.free_form_only = st.toggle(
             "Free-form tool calling only",
             value=ss.free_form_only,
