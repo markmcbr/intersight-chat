@@ -59,8 +59,13 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 # Whether to let models with a "thinking" capability emit visible reasoning
-# traces. False ⇒ ~2x faster on nemotron / gpt-oss; ignored by other models.
-THINKING_ENABLED = _env_bool("LLM_THINKING", False)
+# traces. We default to True because some reasoning models (notably
+# nemotron-3-super:120b on Ollama 0.30) return an EMPTY response when
+# think=false is sent via the OpenAI-compat endpoint — Ollama eats both
+# the thinking block AND the answer. Override to False only on models
+# you've verified handle the toggle correctly. Models without thinking
+# support silently ignore this option, so it's safe to send to all.
+THINKING_ENABLED = _env_bool("LLM_THINKING", True)
 
 # NOTE on context size: we deliberately do NOT send num_ctx here. Ollama's
 # OpenAI-compatible /v1/chat/completions endpoint silently drops the

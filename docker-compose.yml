@@ -70,15 +70,19 @@ services:
       # variable so `make up-gpu` pulls and pre-warms the right model.
       DEFAULT_MODEL: ${DEFAULT_MODEL:-mistral-small3.1:24b}
       # Reasoning-trace toggle for models with a "thinking" capability
-      # (e.g. nemotron-3-super, gpt-oss). When true the model emits a
-      # large internal think block before the answer — accurate but
-      # slow. For tool-call demos we want speed, not visible reasoning.
+      # (e.g. nemotron-3-super, gpt-oss). Default is true because some
+      # reasoning models (notably nemotron-3-super:120b on Ollama 0.30)
+      # return an EMPTY response when think=false is sent via the
+      # OpenAI-compat endpoint — the parser eats the thinking block AND
+      # the answer. Leaving it on costs ~1-2s of latency for a short
+      # internal reasoning trace but guarantees the model actually
+      # replies. Set to false only for models you've explicitly tested.
       # Models without thinking support silently ignore this option.
       # Note: num_ctx is enforced on the ollama container via
       # OLLAMA_CONTEXT_LENGTH (the OpenAI-compat endpoint ignores
       # per-request options) — keep LLM_NUM_CTX and OLLAMA_CONTEXT_LENGTH
       # in sync if you override either.
-      LLM_THINKING: ${LLM_THINKING:-false}
+      LLM_THINKING: ${LLM_THINKING:-true}
     restart: unless-stopped
 
 volumes:
