@@ -58,32 +58,29 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-# Per-request KV-cache size for Ollama. Capping this is the single biggest
-# speed knob for big models on a 48 GB GPU: e.g. nemotron-3-super:120b
-# advertises 256K max context but allocating that much KV cache forces CPU
-# offload and drops throughput ~4x. 8K is plenty for this app's prompts.
-NUM_CTX = _env_int("LLM_NUM_CTX", 8192)
-
 # Whether to let models with a "thinking" capability emit visible reasoning
 # traces. False ⇒ ~2x faster on nemotron / gpt-oss; ignored by other models.
 THINKING_ENABLED = _env_bool("LLM_THINKING", False)
+
+# NOTE on context size: we deliberately do NOT send num_ctx here. Ollama's
+# OpenAI-compatible /v1/chat/completions endpoint silently drops the
+# nested options.num_ctx field (ollama/ollama#6286, #6544). The correct
+# place to cap KV-cache size is the OLLAMA_CONTEXT_LENGTH env var on the
+# ollama container itself; see docker-compose.yml.
 
 
 def _build_extra_body() -> dict[str, Any]:
     """Construct the `extra_body` dict for an Ollama chat request.
 
-    Centralized so both the tool-call loop and the format-only path stay in
-    sync. `options` is Ollama's per-request runtime-tuning bag (num_ctx,
-    num_predict, etc.); `think` is the top-level toggle for reasoning
-    models. Models that don't recognize an option silently ignore it, so
-    this is safe to send to every model.
+    Centralized so both the tool-call loop and the format-only path stay
+    in sync. Only fields Ollama's OpenAI-compat layer actually honors
+    are included: `keep_alive` (pin model in VRAM) and `think` (toggle
+    reasoning traces on supported models). Models that don't recognize a
+    field silently ignore it, so this is safe to send to every model.
     """
     return {
         "keep_alive": KEEP_ALIVE,
         "think": THINKING_ENABLED,
-        "options": {
-            "num_ctx": NUM_CTX,
-        },
     }
 
 

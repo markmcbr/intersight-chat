@@ -26,6 +26,16 @@ services:
       # warm at once; on a single 48 GB GPU that fragments memory and
       # eventually segfaults llama-server. 1 = swap on demand.
       OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      # Server-side default for the KV-cache size. This MUST be set on
+      # the ollama container (not as a per-request option) because the
+      # OpenAI-compat /v1/chat/completions endpoint silently drops the
+      # nested options.num_ctx field — see ollama/ollama#6286 and #6544.
+      # Big models advertise huge max contexts (nemotron-3-super:120b =
+      # 256K) and the runtime allocates KV memory for the WHOLE window
+      # upfront, which forces CPU offload on a 48 GB GPU and tanks
+      # throughput from ~25 to ~6 tok/s. 8192 is plenty for every
+      # deterministic-route prompt in this app.
+      OLLAMA_CONTEXT_LENGTH: ${LLM_NUM_CTX:-8192}
     volumes:
       # Persist downloaded models across restarts. `docker compose down -v`
       # wipes them.
@@ -59,19 +69,15 @@ services:
       # model if this one isn't pulled. Must match Makefile's MODEL
       # variable so `make up-gpu` pulls and pre-warms the right model.
       DEFAULT_MODEL: ${DEFAULT_MODEL:-mistral-small3.1:24b}
-      # Per-request KV-cache size sent to Ollama. Models advertise huge
-      # max contexts (e.g. nemotron-3-super:120b = 256K), but the
-      # runtime allocates KV memory for the WHOLE num_ctx upfront — for
-      # a 120B MoE that's tens of GB and forces CPU offload on a single
-      # L40S, dropping throughput from ~25 to ~6 tok/s. 8K is plenty for
-      # this app's longest deterministic-route prompts (~5–6K tokens).
-      # Raise it only if you're feeding very long reference documents.
-      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
       # Reasoning-trace toggle for models with a "thinking" capability
       # (e.g. nemotron-3-super, gpt-oss). When true the model emits a
       # large internal think block before the answer — accurate but
       # slow. For tool-call demos we want speed, not visible reasoning.
       # Models without thinking support silently ignore this option.
+      # Note: num_ctx is enforced on the ollama container via
+      # OLLAMA_CONTEXT_LENGTH (the OpenAI-compat endpoint ignores
+      # per-request options) — keep LLM_NUM_CTX and OLLAMA_CONTEXT_LENGTH
+      # in sync if you override either.
       LLM_THINKING: ${LLM_THINKING:-false}
     restart: unless-stopped
 

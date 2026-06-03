@@ -273,10 +273,15 @@ question into smaller steps.
 **Model feels slow (`X tok/s` is single digits)** → the prompt is fine
 but the model's KV cache is sized for its advertised max context. Big
 models (e.g. `nemotron-3-super:120b` defaults to 256K) allocate that
-upfront, which forces CPU offload on a 48 GB GPU. Override
-`LLM_NUM_CTX=8192` in `.env` and restart the app; throughput typically
-3–4x. For reasoning models (nemotron, gpt-oss) also set
-`LLM_THINKING=false` to skip the visible reasoning trace.
+upfront, which forces CPU offload on a 48 GB GPU. The defaults already
+cap this at `LLM_NUM_CTX=8192` — but this knob is enforced server-side
+via `OLLAMA_CONTEXT_LENGTH` on the ollama container (Ollama's
+OpenAI-compat endpoint silently ignores per-request `num_ctx`). After
+changing `.env`, run `docker compose down && docker compose up -d`
+(not `restart` — env-var changes need a fresh container). The footer's
+`/ N ctx` value confirms it took effect. For reasoning models
+(nemotron, gpt-oss) also set `LLM_THINKING=false` to skip the visible
+reasoning trace.
 
 **`llama-server process has terminated: signal: segmentation fault`** →
 classic VRAM contention after a sidebar model swap. Either pick the
