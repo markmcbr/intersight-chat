@@ -168,6 +168,12 @@ def init_state() -> None:
     # lives inside ss.messages as user/assistant primer pairs (see
     # extract_text_from_uploaded_file + the sidebar attachment handler).
     ss.setdefault("attached_docs", [])
+    # Demo control: when True, every prompt goes through the LLM's
+    # free-form tool-calling path, bypassing the deterministic
+    # Python-driven chat routes in reports.py. Useful for showcasing
+    # the model's autonomous tool selection (or stress-testing it).
+    # Defaults to False so the production-grade routes stay on.
+    ss.setdefault("free_form_only", False)
 
 
 # ---------------------------------------------------------------- model pre-warm
@@ -413,6 +419,29 @@ def render_sidebar() -> None:
             st.markdown("**Attached:**")
             for d in ss.attached_docs:
                 st.caption(f"📎 {d['name']} (~{d['tokens']:,} tokens)")
+
+        st.divider()
+
+        # ---------- Demo mode ----------
+        st.markdown("### 6. Demo Mode")
+        ss.free_form_only = st.toggle(
+            "Free-form tool calling only",
+            value=ss.free_form_only,
+            help=(
+                "OFF (default): well-known prompts like 'list server "
+                "profiles' or 'inventory report' use deterministic "
+                "Python routes — fast and predictable.\n\n"
+                "ON: every prompt goes through the LLM's tool-calling "
+                "loop. The model picks the MCP tool itself. Use this "
+                "to showcase the model's agentic ability (and to "
+                "compare reliability across models)."
+            ),
+        )
+        if ss.free_form_only:
+            st.caption(
+                "⚡ All prompts will exercise the model's autonomous "
+                "tool selection — deterministic routes are bypassed."
+            )
 
         st.divider()
 
@@ -723,7 +752,14 @@ def handle_user_message(prompt: str) -> None:
     # missing capabilities, double-call, or get the chassis slot math wrong.
     # Any prompt that doesn't match a route falls through to the normal
     # tool-calling chat path below.
-    demo_spec = match_chat_route(prompt)
+    #
+    # The sidebar's "Free-form tool calling only" toggle short-circuits
+    # this fast lane: when on, every prompt — including the well-known
+    # ones — exercises the LLM's autonomous tool selection. Useful for
+    # demoing the model's agentic ability or stress-testing reliability.
+    demo_spec = (
+        None if ss.free_form_only else match_chat_route(prompt)
+    )
     if demo_spec is not None:
         # Substitute the user's literal prompt for the spec's stock
         # user_message so chat history shows what was actually typed.
