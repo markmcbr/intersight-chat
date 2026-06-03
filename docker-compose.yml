@@ -16,6 +16,16 @@ services:
       # model-load cost. Default is 5m. The orchestrator also passes this
       # per-request, but setting it here covers everything.
       OLLAMA_KEEP_ALIVE: 24h
+      # Single-slot inference: frees VRAM that Ollama would otherwise
+      # reserve for parallel inference streams (default 4). Big models
+      # like nemotron-3-super:120b want every spare byte for KV cache,
+      # and this app only ever issues one request at a time anyway.
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-1}
+      # Cap the number of models held in VRAM simultaneously. With the
+      # sidebar model picker it's tempting for Ollama to keep several
+      # warm at once; on a single 48 GB GPU that fragments memory and
+      # eventually segfaults llama-server. 1 = swap on demand.
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
     volumes:
       # Persist downloaded models across restarts. `docker compose down -v`
       # wipes them.
@@ -49,6 +59,20 @@ services:
       # model if this one isn't pulled. Must match Makefile's MODEL
       # variable so `make up-gpu` pulls and pre-warms the right model.
       DEFAULT_MODEL: ${DEFAULT_MODEL:-mistral-small3.1:24b}
+      # Per-request KV-cache size sent to Ollama. Models advertise huge
+      # max contexts (e.g. nemotron-3-super:120b = 256K), but the
+      # runtime allocates KV memory for the WHOLE num_ctx upfront — for
+      # a 120B MoE that's tens of GB and forces CPU offload on a single
+      # L40S, dropping throughput from ~25 to ~6 tok/s. 8K is plenty for
+      # this app's longest deterministic-route prompts (~5–6K tokens).
+      # Raise it only if you're feeding very long reference documents.
+      LLM_NUM_CTX: ${LLM_NUM_CTX:-8192}
+      # Reasoning-trace toggle for models with a "thinking" capability
+      # (e.g. nemotron-3-super, gpt-oss). When true the model emits a
+      # large internal think block before the answer — accurate but
+      # slow. For tool-call demos we want speed, not visible reasoning.
+      # Models without thinking support silently ignore this option.
+      LLM_THINKING: ${LLM_THINKING:-false}
     restart: unless-stopped
 
 volumes:

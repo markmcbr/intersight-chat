@@ -10,6 +10,7 @@ Python changes needed.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,59 @@ KEEP_ALIVE = "24h"
 # doing function calling: low enough to be reliable, not so low (0.0) that
 # we cargo-cult an artifact-prone setting.
 TEMPERATURE = 0.2
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer env var, falling back to `default` on missing/garbage."""
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"[orchestrator] WARN: {name}={raw!r} is not an int, "
+            f"falling back to {default}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Per-request KV-cache size for Ollama. Capping this is the single biggest
+# speed knob for big models on a 48 GB GPU: e.g. nemotron-3-super:120b
+# advertises 256K max context but allocating that much KV cache forces CPU
+# offload and drops throughput ~4x. 8K is plenty for this app's prompts.
+NUM_CTX = _env_int("LLM_NUM_CTX", 8192)
+
+# Whether to let models with a "thinking" capability emit visible reasoning
+# traces. False ⇒ ~2x faster on nemotron / gpt-oss; ignored by other models.
+THINKING_ENABLED = _env_bool("LLM_THINKING", False)
+
+
+def _build_extra_body() -> dict[str, Any]:
+    """Construct the `extra_body` dict for an Ollama chat request.
+
+    Centralized so both the tool-call loop and the format-only path stay in
+    sync. `options` is Ollama's per-request runtime-tuning bag (num_ctx,
+    num_predict, etc.); `think` is the top-level toggle for reasoning
+    models. Models that don't recognize an option silently ignore it, so
+    this is safe to send to every model.
+    """
+    return {
+        "keep_alive": KEEP_ALIVE,
+        "think": THINKING_ENABLED,
+        "options": {
+            "num_ctx": NUM_CTX,
+        },
+    }
 
 
 def _log(msg: str) -> None:
@@ -467,7 +521,7 @@ class Orchestrator:
                     temperature=TEMPERATURE,
                     stream=True,
                     stream_options={"include_usage": True},
-                    extra_body={"keep_alive": KEEP_ALIVE},
+                    extra_body=_build_extra_body(),
                 )
                 for chunk in stream:
                     # The usage chunk arrives at the end with an empty `choices`
@@ -713,7 +767,7 @@ class Orchestrator:
                 temperature=TEMPERATURE,
                 stream=True,
                 stream_options={"include_usage": True},
-                extra_body={"keep_alive": KEEP_ALIVE},
+                extra_body=_build_extra_body(),
             )
             for chunk in stream:
                 if getattr(chunk, "usage", None):

@@ -270,6 +270,20 @@ the same tool 3 times in a row"** → small models can spin on multi-step
 questions. Try a bigger model (`qwen2.5:32b` or `:72b`) or break the
 question into smaller steps.
 
+**Model feels slow (`X tok/s` is single digits)** → the prompt is fine
+but the model's KV cache is sized for its advertised max context. Big
+models (e.g. `nemotron-3-super:120b` defaults to 256K) allocate that
+upfront, which forces CPU offload on a 48 GB GPU. Override
+`LLM_NUM_CTX=8192` in `.env` and restart the app; throughput typically
+3–4x. For reasoning models (nemotron, gpt-oss) also set
+`LLM_THINKING=false` to skip the visible reasoning trace.
+
+**`llama-server process has terminated: signal: segmentation fault`** →
+classic VRAM contention after a sidebar model swap. Either pick the
+model again (forces a clean reload) or run
+`docker compose exec ollama ollama stop <model>` and try again. Setting
+`OLLAMA_MAX_LOADED_MODELS=1` in `.env` makes this much less frequent.
+
 **MCP server fails to start** → make sure the build stage ran cleanly:
 `make build` then `make logs` and look for `intersight-mcp-server: ready
 on stdio`.
