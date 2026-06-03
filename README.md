@@ -282,7 +282,7 @@ question into smaller steps.
 but the model's KV cache is sized for its advertised max context. Big
 models (e.g. `nemotron-3-super:120b` defaults to 256K) allocate that
 upfront, which forces CPU offload on a 48 GB GPU. The defaults cap
-this at `LLM_NUM_CTX=8192` via `OLLAMA_CONTEXT_LENGTH` on the ollama
+this at `LLM_NUM_CTX=32768` via `OLLAMA_CONTEXT_LENGTH` on the ollama
 container — but **some models bake `num_ctx` into their own Modelfile
 and override the env var.** If the footer still shows `/ 262,144 ctx`
 (or similar) after `docker compose down && up -d`, derive a smaller
@@ -292,7 +292,7 @@ variant explicitly:
 docker compose exec ollama sh -c '
 cat > /tmp/Modelfile.fast <<EOF
 FROM nemotron-3-super:120b
-PARAMETER num_ctx 8192
+PARAMETER num_ctx 32768
 EOF
 ollama create nemotron-3-super-fast:120b -f /tmp/Modelfile.fast
 '
@@ -306,6 +306,16 @@ toggle correctly. On Ollama 0.30 with `nemotron-3-super:120b`,
 `think=false` via the OpenAI-compat endpoint suppresses *both* the
 thinking block and the actual answer. Leave `LLM_THINKING=true` (the
 default) and the model will reply normally.
+
+**Tool call executes but no final assistant message renders** → the
+context window is too small for round 2 (system prompt + tool schemas
++ tool result + reasoning + answer ≈ 4–6K tokens for typical
+inventory calls). Symptom in `make logs`:
+`round=1 ... prompt_tokens=8191 completion_tokens=1` — the model
+emits only the EOS token because the prompt filled the window. The
+defaults set `LLM_NUM_CTX=32768` which gives ~24K of headroom; raise
+it further (`LLM_NUM_CTX=65536` etc.) only if you load very long
+reference documents AND the GPU can spare the VRAM.
 
 **`llama-server process has terminated: signal: segmentation fault`** →
 classic VRAM contention after a sidebar model swap. Either pick the
