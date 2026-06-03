@@ -170,10 +170,11 @@ def init_state() -> None:
     ss.setdefault("attached_docs", [])
     # Demo control: when True, every prompt goes through the LLM's
     # free-form tool-calling path, bypassing the deterministic
-    # Python-driven chat routes in reports.py. Useful for showcasing
-    # the model's autonomous tool selection (or stress-testing it).
-    # Defaults to False so the production-grade routes stay on.
-    ss.setdefault("free_form_only", False)
+    # Python-driven chat routes in reports.py. Defaults to True so
+    # the headline demo beat — "the model picks the MCP tool itself"
+    # — is the default behavior. Flip the sidebar toggle off to use
+    # the deterministic Python routes for the well-known prompts.
+    ss.setdefault("free_form_only", True)
 
 
 # ---------------------------------------------------------------- model pre-warm
@@ -428,13 +429,13 @@ def render_sidebar() -> None:
             "Free-form tool calling only",
             value=ss.free_form_only,
             help=(
-                "OFF (default): well-known prompts like 'list server "
-                "profiles' or 'inventory report' use deterministic "
-                "Python routes — fast and predictable.\n\n"
-                "ON: every prompt goes through the LLM's tool-calling "
-                "loop. The model picks the MCP tool itself. Use this "
-                "to showcase the model's agentic ability (and to "
-                "compare reliability across models)."
+                "ON (default): every prompt goes through the LLM's "
+                "tool-calling loop. The model picks the MCP tool "
+                "itself — showcases the model's agentic ability.\n\n"
+                "OFF: well-known prompts like 'list server profiles' "
+                "or 'inventory report' use deterministic Python "
+                "routes — faster and more predictable, since Python "
+                "drives the data gather and the LLM only formats."
             ),
         )
         if ss.free_form_only:
