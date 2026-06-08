@@ -162,7 +162,7 @@ intersight-chat/
     ├── tsconfig.json
     └── src/
         ├── index.ts             # MCP stdio server
-        ├── tools.ts             # Tool definitions (17 read-only tools)
+        ├── tools.ts             # Tool definitions (19 total; 18 visible to the model)
         ├── intersight-api.ts    # Signed HTTP client
         └── auth.ts              # HTTP-signature signing (ECDSA / RSA)
 ```
@@ -192,9 +192,11 @@ The MCP server exposes these tools to the model:
 | `get_advisories` | `GET /api/v1/tam/AdvisoryInstances` |
 | `get_contracts` | `GET /api/v1/asset/DeviceContractInformations` |
 | `generic_api_call` | any path under `/api/v1/` (escape hatch) |
+| `list_tools` | — (returns this tool catalog; no Intersight call) |
 
-`configure_credentials` is a 17th tool but it's hidden from the model —
-the host app sets credentials directly from the sidebar.
+These are the **18 tools the model can call** — exactly what `list_tools`
+reports back. `configure_credentials` is a 19th tool but it's hidden from
+the model — the host app sets credentials directly from the sidebar.
 
 All "list" tools accept OData params (`filter`, `select`, `top`, `skip`,
 `orderby`) and return a curated default field set to keep token usage
