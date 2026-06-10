@@ -34,7 +34,10 @@ This app is intended to run on a Linux server with an NVIDIA GPU.
 - **Docker Engine 24+** with the Compose plugin
 - **NVIDIA Container Toolkit** so Docker can hand the GPU to Ollama
 - A Cisco Intersight **v3 API key** (Key ID + PEM private key) for the
-  account you want to query
+  account you want to query. An API key inherits the privileges of the
+  Intersight **user and role** that created it, so a **read-only role is
+  sufficient — and recommended — for this app**, which only reads
+  inventory. Create the key under a least-privilege (read-only) user.
 
 ### Verify GPU passthrough works
 
@@ -338,10 +341,17 @@ on stdio`.
   memory.
 - The model never sees `configure_credentials` — that tool is reserved
   for the host application.
-- All Intersight tool calls are read-only (`GET`). The `generic_api_call`
-  escape hatch *can* issue `POST`/`PATCH`/`DELETE` if the model decides
-  to, but our system prompt steers it toward read-only operations. If
-  you want to lock this down hard, add an allowlist check in
+- The key's effective permissions come from the Intersight **user role**
+  that created it — not from this app. Because the demo only collects
+  inventory, create the key with a **read-only role**; Intersight then
+  rejects any write attempt server-side (e.g. a stray `generic_api_call`
+  `POST`/`PATCH`/`DELETE`) with a 403, regardless of what the model does.
+  This role-based enforcement is the real security boundary.
+- All of this app's curated tools are read-only (`GET`). The
+  `generic_api_call` escape hatch *can* issue `POST`/`PATCH`/`DELETE`,
+  but our system prompt steers it toward read-only operations — defense
+  in depth on top of the read-only key above. If you want to lock this
+  down in the app itself, add an allowlist check in
   `mcp-server/src/intersight-api.ts`.
 - For **on-prem Intersight Appliance**, set `INTERSIGHT_BASE_URL` in
   `.env` (or in the compose `environment:` block) to your appliance
